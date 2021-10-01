@@ -3,11 +3,16 @@ package filer
 import (
 	"archive/zip"
 	"bytes"
+	"fmt"
+	"io"
+	"io/fs"
 	"io/ioutil"
+	"net/http"
 	"os"
 	xpath "path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -338,3 +343,83 @@ func (filer *nestedFiler) Close() {
 func (filer *nestedFiler) PathsAreAlwaysSlash() bool {
 	return filer.origin.PathsAreAlwaysSlash()
 }
+
+// FromGoModule returns a Filer that fetches Go module contents from a Go module proxy.
+func FromGoModule(module string) Filer { return &modFiler{module: module} }
+
+type modFiler struct {
+	module string
+
+	once sync.Once
+	r    *zip.Reader
+	err  error
+}
+
+func (filer *modFiler) init() error {
+	filer.once.Do(func() {
+		parts := strings.Split(filer.module, "@")
+		if len(parts) != 2 {
+			filer.err = fmt.Errorf("module must contain one @ character")
+			return
+		}
+		// TODO: don't assume default GOPROXY
+		resp, err := http.Get(fmt.Sprintf("https://proxy.golang.org/%s/@v/%s.zip", parts[0], parts[1]))
+		if err != nil {
+			filer.err = err
+			return
+		}
+		defer resp.Body.Close()
+		all, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			filer.err = err
+			return
+		}
+		filer.r, filer.err = zip.NewReader(bytes.NewReader(all), int64(len(all)))
+	})
+	return filer.err
+}
+
+func (filer *modFiler) ReadFile(path string) ([]byte, error) {
+	if err := filer.init(); err != nil {
+		return nil, err
+	}
+
+	f, err := filer.r.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (filer *modFiler) ReadDir(path string) ([]File, error) {
+	if err := filer.init(); err != nil {
+		return nil, err
+	}
+
+	f, err := filer.r.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	dir, ok := f.(fs.ReadDirFile)
+	if !ok {
+		return nil, errors.New("not a directory")
+	}
+	ents, err := dir.ReadDir(0)
+	if err != nil {
+		return nil, err
+	}
+	var files []File
+	for _, ent := range ents {
+		files = append(files, File{Name: ent.Name(), IsDir: ent.IsDir()})
+	}
+	return files, nil
+}
+
+func (filer *modFiler) Close()                    {}
+func (filer *modFiler) PathsAreAlwaysSlash() bool { return true }
